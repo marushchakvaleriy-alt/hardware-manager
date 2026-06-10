@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Local settings
+config.json
+
+# Production build (ignored here because it is built from frontend, but we actually serve frontend/dist, and we want to keep frontend build clean. Wait, should we commit frontend/dist? Yes, if we commit frontend/dist, the other user doesn't even have to build the React app - they can just run node server.js and it works instantly! That's incredibly helpful. So we do NOT ignore frontend/dist in the root gitignore, or we can build it there.)
+# frontend/dist is NOT ignored, so it remains in Git, making the app 100% plug-and-play for others without needing to run npm run build!
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# OS Files
+.DS_Store
+Thumbs.db
