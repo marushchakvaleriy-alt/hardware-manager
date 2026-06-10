@@ -70,6 +70,7 @@ style.innerHTML = `@keyframes spin { to { transform: rotate(360deg); } }`;
 document.head.appendChild(style);
 
 function App() {
+  const [db, setDb] = useState({ folders: [], notes: {} });
   const [tree, setTree] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -88,37 +89,12 @@ function App() {
 
   // Settings states
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsPath, setSettingsPath] = useState('');
-  const [activePathOnServer, setActivePathOnServer] = useState('');
-
-  // API base URL (uses localhost:3001 in dev, relative in production)
-  const API_BASE = window.location.port === '5173' ? 'http://localhost:3001' : '';
+  const [settingsToken, setSettingsToken] = useState(localStorage.getItem('gh_token') || '');
+  const [settingsRepo, setSettingsRepo] = useState(localStorage.getItem('gh_repo') || 'marushchakvaleriy-alt/hardware-manager');
 
   useEffect(() => {
     fetchTree();
-    fetchSettings();
   }, []);
-
-  // Compute statistics (total folders and text documents)
-  const computeStats = (nodes) => {
-    let foldersCount = 0;
-    let docsCount = 0;
-
-    const traverse = (nodeList) => {
-      nodeList.forEach(node => {
-        if (node.isDir) {
-          foldersCount++;
-          if (node.documents) {
-            docsCount += node.documents.length;
-          }
-          if (node.children) traverse(node.children);
-        }
-      });
-    };
-
-    traverse(nodes);
-    setStats({ folders: foldersCount, files: docsCount });
-  };
 
   const showToast = (message, type = 'success') => {
     setToast({ message, type });
@@ -127,80 +103,176 @@ function App() {
     }, 4000);
   };
 
-  const fetchSettings = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/settings`);
-      const data = await res.json();
-      if (data.success) {
-        setSettingsPath(data.bazisRoot);
-        setActivePathOnServer(data.bazisRoot);
+  // Build hierarchical folder tree from paths array in db.json
+  const buildTreeFromPaths = (paths, database) => {
+    const rootTree = [];
+    paths.forEach(p => {
+      const parts = p.split('/');
+      let currentLevel = rootTree;
+      let accumulatedPath = '';
+      
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        accumulatedPath = accumulatedPath ? `${accumulatedPath}/${part}` : part;
+        
+        let node = currentLevel.find(n => n.name === part && n.isDir);
+        if (!node) {
+          node = {
+            name: part,
+            path: accumulatedPath,
+            isDir: true,
+            children: [],
+            // Attach document names for this folder path
+            documents: database.notes && database.notes[accumulatedPath] 
+              ? Object.keys(database.notes[accumulatedPath]) 
+              : []
+          };
+          currentLevel.push(node);
+          currentLevel.sort((a, b) => a.name.localeCompare(b.name));
+        }
+        currentLevel = node.children;
       }
-    } catch (err) {
-      console.error('Не вдалося зчитати налаштування', err);
-    }
+    });
+    return rootTree;
   };
 
-  const saveSettings = async (e) => {
-    e.preventDefault();
-    try {
-      const res = await fetch(`${API_BASE}/api/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ newRoot: settingsPath })
+  const computeStats = (paths, database) => {
+    let docsCount = 0;
+    if (database.notes) {
+      Object.values(database.notes).forEach(folderDocs => {
+        docsCount += Object.keys(folderDocs).length;
       });
-      const data = await res.json();
-      if (data.success) {
-        showToast('Шлях до папки успішно змінено!', 'success');
-        setActivePathOnServer(data.bazisRoot);
-        setShowSettings(false);
-        setSelectedNode(null); // Reset selection
-        setSelectedDoc(null);
-        fetchTree();
-      } else {
-        showToast(data.error || 'Помилка зміни шляху', 'error');
-      }
-    } catch (err) {
-      console.error(err);
-      showToast('Помилка з’єднання із сервером', 'error');
     }
+    setStats({ folders: paths.length, files: docsCount });
+  };
+
+  // Fetch db.json from GitHub API (if token exists) or fallback to static file
+  const fetchDatabase = async () => {
+    const token = localStorage.getItem('gh_token');
+    const repo = localStorage.getItem('gh_repo') || 'marushchakvaleriy-alt/hardware-manager';
+    
+    if (token) {
+      try {
+        const res = await fetch(`https://api.github.com/repos/${repo}/contents/db.json`, {
+          headers: { 
+            'Authorization': `token ${token}`,
+            'Accept': 'application/vnd.github.v3.raw',
+            'Cache-Control': 'no-cache'
+          }
+        });
+        if (res.ok) {
+          return await res.json();
+        }
+      } catch (e) {
+        console.error('Не вдалося зчитати з GitHub API, пробуємо завантажити локальний файл', e);
+      }
+    }
+    
+    // Fallback: load static file (useful for readers or local runs)
+    const res = await fetch('./db.json', { cache: 'no-store' });
+    if (!res.ok) {
+      throw new Error('Не вдалося завантажити db.json. Перевірте підключення.');
+    }
+    return await res.json();
+  };
+
+  // Save database object to GitHub via Commit API
+  const saveDatabaseToGitHub = async (updatedDb, commitMessage) => {
+    const token = localStorage.getItem('gh_token');
+    const repo = localStorage.getItem('gh_repo') || 'marushchakvaleriy-alt/hardware-manager';
+    
+    if (!token) {
+      throw new Error('Токен авторизації не знайдено! Введіть його у налаштуваннях ⚙️ для редагування.');
+    }
+    
+    // Step 1: Get current file SHA
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/db.json`, {
+      headers: {
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github.v3.json',
+        'Cache-Control': 'no-cache'
+      }
+    });
+    
+    if (!getRes.ok) {
+      throw new Error(`Не вдалося отримати SHA файлу з GitHub: ${getRes.statusText}. Перевірте токен.`);
+    }
+    
+    const getData = await getRes.json();
+    const sha = getData.sha;
+    
+    // Step 2: Write update
+    const jsonStr = JSON.stringify(updatedDb, null, 2);
+    // Unicode-safe Base64 conversion
+    const utf8Bytes = new TextEncoder().encode(jsonStr);
+    const binaryStr = Array.from(utf8Bytes, byte => String.fromCharCode(byte)).join('');
+    const base64Content = btoa(binaryStr);
+    
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/db.json`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github.v3.json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message: commitMessage,
+        content: base64Content,
+        sha: sha,
+        branch: 'main'
+      })
+    });
+    
+    if (!putRes.ok) {
+      const errData = await putRes.json();
+      throw new Error(errData.message || 'Помилка запису коміту на GitHub.');
+    }
+    
+    return true;
   };
 
   const fetchTree = async (reselectPath = null, reselectDoc = null) => {
     try {
       if (!reselectPath) setLoading(true);
-      const res = await fetch(`${API_BASE}/api/tree`);
-      const data = await res.json();
-      if (data.success) {
-        setTree(data.tree);
-        computeStats(data.tree);
-        
-        // Auto-expand first level folders on initial load
-        if (!reselectPath) {
-          const initialExpanded = {};
-          data.tree.forEach(node => {
-            if (node.isDir) {
-              initialExpanded[node.path] = true;
-            }
-          });
-          setExpandedFolders(prev => ({ ...prev, ...initialExpanded }));
-        }
+      const data = await fetchDatabase();
+      setDb(data);
+      
+      const parsedTree = buildTreeFromPaths(data.folders || [], data);
+      setTree(parsedTree);
+      computeStats(data.folders || [], data);
+      
+      // Auto-expand first level folders
+      if (!reselectPath) {
+        const initialExpanded = {};
+        parsedTree.forEach(node => {
+          if (node.isDir) {
+            initialExpanded[node.path] = true;
+          }
+        });
+        setExpandedFolders(prev => ({ ...prev, ...initialExpanded }));
+      }
 
-        // Reselect folder and document if specified
-        if (reselectPath) {
-          findAndSelectNode(data.tree, reselectPath, reselectDoc);
-        }
-      } else {
-        showToast(data.error || 'Не вдалося завантажити дерево папок.', 'error');
-        setTree([]);
-        setStats({ folders: 0, files: 0 });
+      if (reselectPath) {
+        findAndSelectNode(parsedTree, reselectPath, reselectDoc, data);
       }
     } catch (err) {
       console.error(err);
-      showToast('Помилка підключення до сервера', 'error');
-      setTree([]);
+      showToast(err.message || 'Помилка завантаження бази даних.', 'error');
     } finally {
       if (!reselectPath) setLoading(false);
     }
+  };
+
+  const saveSettings = (e) => {
+    e.preventDefault();
+    localStorage.setItem('gh_token', settingsToken.trim());
+    localStorage.setItem('gh_repo', settingsRepo.trim());
+    
+    showToast('Налаштування збережено локально у браузері', 'success');
+    setShowSettings(false);
+    setSelectedNode(null);
+    setSelectedDoc(null);
+    fetchTree();
   };
 
   const selectFolder = (node) => {
@@ -212,26 +284,16 @@ function App() {
     setNewDocName('');
   };
 
-  const selectDocument = async (docName) => {
+  const selectDocument = (docName) => {
     if (!selectedNode) return;
     setSelectedDoc(docName);
     setNoteContent('');
     setNoteStatus('idle');
 
-    try {
-      const res = await fetch(
-        `${API_BASE}/api/file?folderPath=${encodeURIComponent(selectedNode.path)}&docName=${encodeURIComponent(docName)}`
-      );
-      const data = await res.json();
-      if (data.success) {
-        setNoteContent(data.content);
-      } else {
-        showToast(data.error || 'Не вдалося зчитати документ', 'error');
-      }
-    } catch (err) {
-      console.error(err);
-      showToast('Помилка зчитування документа', 'error');
-    }
+    // Read content directly from local db state
+    const folderNotes = db.notes[selectedNode.path] || {};
+    const content = folderNotes[docName] || '';
+    setNoteContent(content);
   };
 
   const saveDocument = async () => {
@@ -239,30 +301,26 @@ function App() {
     setNoteStatus('saving');
 
     try {
-      const res = await fetch(`${API_BASE}/api/file`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          folderPath: selectedNode.path,
-          docName: selectedDoc,
-          content: noteContent
-        })
-      });
-      const data = await res.json();
-      if (data.success) {
-        setNoteStatus('saved');
-        showToast(`Документ "${selectedDoc}" збережено`, 'success');
-        
-        // Refresh tree to maintain state
-        await fetchTree(selectedNode.path, selectedDoc);
-      } else {
-        setNoteStatus('error');
-        showToast(data.error || 'Помилка збереження документа', 'error');
+      const updatedNotes = { ...db.notes };
+      if (!updatedNotes[selectedNode.path]) {
+        updatedNotes[selectedNode.path] = {};
       }
+      updatedNotes[selectedNode.path][selectedDoc] = noteContent;
+
+      const updatedDb = { ...db, notes: updatedNotes };
+      
+      await saveDatabaseToGitHub(updatedDb, `Збережено вміст документа "${selectedDoc}" у папці "${selectedNode.path}"`);
+      
+      setDb(updatedDb);
+      setNoteStatus('saved');
+      showToast(`Документ "${selectedDoc}" успішно збережено на GitHub!`, 'success');
+      
+      // Update state internally
+      await fetchTree(selectedNode.path, selectedDoc);
     } catch (err) {
       console.error(err);
       setNoteStatus('error');
-      showToast('Помилка збереження на сервері', 'error');
+      showToast(err.message || 'Помилка збереження на GitHub', 'error');
     }
   };
 
@@ -272,78 +330,100 @@ function App() {
 
     const docName = newDocName.trim();
 
-    // Check if it already exists in the selected node documents
     if (selectedNode.documents && selectedNode.documents.includes(docName)) {
-      showToast('Документ з такою назвою вже існує в цій папці', 'error');
+      showToast('Документ з такою назвою вже існує', 'error');
       return;
     }
 
     try {
-      const res = await fetch(`${API_BASE}/api/file`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          folderPath: selectedNode.path,
-          docName: docName,
-          content: '' // empty content on creation
-        })
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast(`Документ "${docName}" успішно створено`, 'success');
-        setNewDocName('');
-        
-        // Refresh and automatically select the new document
-        await fetchTree(selectedNode.path, docName);
-      } else {
-        showToast(data.error || 'Помилка створення документа', 'error');
+      const updatedNotes = { ...db.notes };
+      if (!updatedNotes[selectedNode.path]) {
+        updatedNotes[selectedNode.path] = {};
       }
+      updatedNotes[selectedNode.path][docName] = ''; // empty content
+
+      const updatedDb = { ...db, notes: updatedNotes };
+      
+      await saveDatabaseToGitHub(updatedDb, `Створено новий документ "${docName}" у папці "${selectedNode.path}"`);
+      
+      setDb(updatedDb);
+      setNewDocName('');
+      showToast(`Документ "${docName}" створено на GitHub`, 'success');
+      
+      await fetchTree(selectedNode.path, docName);
     } catch (err) {
       console.error(err);
-      showToast('Помилка з’єднання із сервером', 'error');
+      showToast(err.message || 'Помилка створення документа', 'error');
     }
   };
 
   const deleteDocument = async (docName, e) => {
-    e.stopPropagation(); // Prevent choosing the document when deleting
-    
+    e.stopPropagation();
     if (!window.confirm(`Ви дійсно бажаєте видалити документ "${docName}"?`)) {
       return;
     }
 
     try {
-      const res = await fetch(`${API_BASE}/api/file`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          folderPath: selectedNode.path,
-          docName: docName
-        })
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast(`Документ "${docName}" успішно видалено`, 'success');
-        
-        let nextSelectedDoc = selectedDoc;
-        if (selectedDoc === docName) {
-          nextSelectedDoc = null;
-          setNoteContent('');
-          setNoteStatus('idle');
+      const updatedNotes = { ...db.notes };
+      if (updatedNotes[selectedNode.path]) {
+        delete updatedNotes[selectedNode.path][docName];
+        if (Object.keys(updatedNotes[selectedNode.path]).length === 0) {
+          delete updatedNotes[selectedNode.path];
         }
-        
-        // Refresh tree and reselect folder
-        await fetchTree(selectedNode.path, nextSelectedDoc);
-      } else {
-        showToast(data.error || 'Помилка видалення документа', 'error');
       }
+
+      const updatedDb = { ...db, notes: updatedNotes };
+      
+      await saveDatabaseToGitHub(updatedDb, `Видалено документ "${docName}" у папці "${selectedNode.path}"`);
+      
+      setDb(updatedDb);
+      
+      let nextSelectedDoc = selectedDoc;
+      if (selectedDoc === docName) {
+        nextSelectedDoc = null;
+        setNoteContent('');
+        setNoteStatus('idle');
+      }
+      
+      showToast(`Документ "${docName}" видалено`, 'success');
+      await fetchTree(selectedNode.path, nextSelectedDoc);
     } catch (err) {
       console.error(err);
-      showToast('Помилка з’єднання із сервером', 'error');
+      showToast(err.message || 'Помилка видалення документа', 'error');
     }
   };
 
-  // Helper to re-select node by path after tree refresh
-  const findAndSelectNode = (nodeList, path, reselectDoc = null) => {
+  const createSubfolder = async (e) => {
+    e.preventDefault();
+    if (!selectedNode || !newFolderName.trim()) return;
+
+    const safeFolderName = newFolderName.trim().replace(/[\\/:*?"<>|]/g, '_');
+    const newFolderRelPath = `${selectedNode.path}/${safeFolderName}`;
+
+    if (db.folders.includes(newFolderRelPath)) {
+      showToast('Папка з такою назвою вже існує в базі', 'error');
+      return;
+    }
+
+    try {
+      const updatedFolders = [...db.folders, newFolderRelPath];
+      const updatedDb = { ...db, folders: updatedFolders };
+      
+      await saveDatabaseToGitHub(updatedDb, `Створено підпапку "${newFolderName}" у "${selectedNode.path}"`);
+      
+      setDb(updatedDb);
+      setNewFolderName('');
+      showToast(`Папку "${safeFolderName}" створено на GitHub`, 'success');
+      
+      setExpandedFolders(prev => ({ ...prev, [selectedNode.path]: true }));
+      await fetchTree(selectedNode.path, selectedDoc);
+    } catch (err) {
+      console.error(err);
+      showToast(err.message || 'Помилка створення папки', 'error');
+    }
+  };
+
+  const findAndSelectNode = (nodeList, path, reselectDoc = null, currentDb = db) => {
     let found = null;
     const search = (nodes) => {
       for (const node of nodes) {
@@ -356,64 +436,23 @@ function App() {
     };
     search(nodeList);
     if (found) {
+      // Re-read current documents list for the node
+      found.documents = currentDb.notes && currentDb.notes[found.path]
+        ? Object.keys(currentDb.notes[found.path])
+        : [];
+      
       setSelectedNode(found);
+      
       if (reselectDoc) {
-        // Find if the doc still exists in this folder
-        if (found.documents && found.documents.includes(reselectDoc)) {
+        if (found.documents.includes(reselectDoc)) {
           setSelectedDoc(reselectDoc);
-          // Reload content
-          fetchDocContentOnly(found.path, reselectDoc);
+          const folderNotes = currentDb.notes[found.path] || {};
+          setNoteContent(folderNotes[reselectDoc] || '');
         } else {
           setSelectedDoc(null);
           setNoteContent('');
         }
       }
-    }
-  };
-
-  const fetchDocContentOnly = async (folderPath, docName) => {
-    try {
-      const res = await fetch(
-        `${API_BASE}/api/file?folderPath=${encodeURIComponent(folderPath)}&docName=${encodeURIComponent(docName)}`
-      );
-      const data = await res.json();
-      if (data.success) {
-        setNoteContent(data.content);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const createSubfolder = async (e) => {
-    e.preventDefault();
-    if (!selectedNode || !newFolderName.trim()) return;
-
-    try {
-      const res = await fetch(`${API_BASE}/api/folder`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          parentPath: selectedNode.path,
-          folderName: newFolderName.trim()
-        })
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast(`Папку "${newFolderName}" створено`, 'success');
-        setNewFolderName('');
-        
-        // Expand the parent so the new folder is visible
-        setExpandedFolders(prev => ({ ...prev, [selectedNode.path]: true }));
-        
-        // Refresh tree and reselect parent
-        await fetchTree(selectedNode.path, selectedDoc);
-      } else {
-        showToast(data.error || 'Не вдалося створити папку', 'error');
-      }
-    } catch (err) {
-      console.error(err);
-      showToast('Помилка з’єднання із сервером', 'error');
     }
   };
 
@@ -425,31 +464,26 @@ function App() {
     }));
   };
 
-  // Recursive search to check if a node matches the query, or has children that match
   const nodeMatchesSearch = (node, query) => {
     if (!query) return true;
     const normalizedQuery = query.toLowerCase();
     const nameMatches = node.name.toLowerCase().includes(normalizedQuery);
     
     if (nameMatches) return true;
-    
     if (node.children) {
-      return node.children.some(child => child.isDir && nodeMatchesSearch(child, query));
+      return node.children.some(child => nodeMatchesSearch(child, query));
     }
-    
     return false;
   };
 
-  // Render directory tree recursively (only directory nodes)
   const renderTree = (nodes, depth = 0) => {
     return nodes
-      .filter(node => node.isDir && nodeMatchesSearch(node, searchQuery))
+      .filter(node => nodeMatchesSearch(node, searchQuery))
       .map(node => {
-        const hasDirs = node.children && node.children.some(child => child.isDir);
+        const hasDirs = node.children && node.children.length > 0;
         const isExpanded = !!expandedFolders[node.path];
         const isSelected = selectedNode && selectedNode.path === node.path;
         
-        // Automatically expand node if searching
         const expandedState = searchQuery ? true : isExpanded;
 
         return (
@@ -467,17 +501,12 @@ function App() {
                   <ChevronIcon expanded={expandedState} />
                 </button>
               ) : (
-                <span style={{ width: '1.4rem' }}></span> // Spacer matching toggle button width
+                <span style={{ width: '1.4rem' }}></span>
               )}
               
-              <FolderIcon isVirtual={node.isVirtual} />
+              <FolderIcon isVirtual={true} /> {/* All folders are in the JSON DB, so render them all styled */}
               <span className="tree-node-text" title={node.name}>
                 {node.name}
-                {node.isVirtual && (
-                  <span style={{ fontSize: '0.7rem', opacity: 0.6, fontStyle: 'italic', marginLeft: '0.4rem' }}>
-                    (віртуальна)
-                  </span>
-                )}
               </span>
             </div>
 
@@ -507,31 +536,39 @@ function App() {
         <div className="modal-overlay" onClick={() => setShowSettings(false)}>
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>Налаштування шляху до бази</h3>
+              <h3>Налаштування інтеграції GitHub</h3>
               <button className="modal-close-btn" onClick={() => setShowSettings(false)}>×</button>
             </div>
             <form onSubmit={saveSettings} className="modal-body">
               <div className="form-group">
-                <label>Повний шлях до вашої папки фурнітури на комп'ютері:</label>
+                <label>GitHub Personal Access Token (PAT):</label>
                 <input 
-                  type="text" 
-                  value={settingsPath}
-                  onChange={(e) => setSettingsPath(e.target.value)}
-                  placeholder="Наприклад: D:\Bazis\# Кріплення та фурнітура\1.Фурнітура"
+                  type="password" 
+                  value={settingsToken}
+                  onChange={(e) => setSettingsToken(e.target.value)}
+                  placeholder="Введіть свій GitHub токен..."
                   className="input-field"
-                  style={{ width: '100%', marginTop: '0.5rem' }}
-                  required
+                  style={{ width: '100%', marginTop: '0.25rem' }}
                 />
                 <p className="form-help-text">
-                  Ви можете вказати шлях до вашого синхронізованого <strong>Google Диску</strong> (наприклад, на диску G: або в іншому місці). Скрипт автоматично підвантажить всі папки.
+                  Токен необхідний для збереження змін (комітів) у репозиторій. Якщо ви хочете лише переглядати документи, токен вводити не потрібно.
                 </p>
-                <p className="form-help-text">
-                  Шлях за замовчуванням (якщо залишити батьківську папку додатка): <code>{window.location.origin}</code> скануватиме папку, де встановлено додаток.
-                </p>
+              </div>
+              <div className="form-group">
+                <label>Координати репозиторію (Користувач/Репозиторій):</label>
+                <input 
+                  type="text" 
+                  value={settingsRepo}
+                  onChange={(e) => setSettingsRepo(e.target.value)}
+                  placeholder="marushchakvaleriy-alt/hardware-manager"
+                  className="input-field"
+                  style={{ width: '100%', marginTop: '0.25rem' }}
+                  required
+                />
               </div>
               <div className="modal-footer">
                 <button type="button" className="btn btn-secondary" onClick={() => setShowSettings(false)}>Скасувати</button>
-                <button type="submit" className="btn btn-primary">Зберегти та оновити</button>
+                <button type="submit" className="btn btn-primary">Зберегти налаштування</button>
               </div>
             </form>
           </div>
@@ -545,7 +582,7 @@ function App() {
             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/>
           </svg>
           <h1>База Фурнітури</h1>
-          <span>Менеджер Документів</span>
+          <span>Хмарний Менеджер Документів</span>
         </div>
         <div className="stats-container">
           <div className="stat-item">
@@ -556,11 +593,8 @@ function App() {
           </div>
           <button 
             className="settings-btn" 
-            title="Налаштування бази папок"
-            onClick={() => {
-              fetchSettings();
-              setShowSettings(true);
-            }}
+            title="Налаштування GitHub"
+            onClick={() => setShowSettings(true)}
           >
             <SettingsIcon />
           </button>
@@ -586,19 +620,19 @@ function App() {
             {loading ? (
               <div className="empty-state">
                 <SpinnerIcon />
-                <p>Сканування файлової структури...</p>
+                <p>Завантаження бази даних з GitHub...</p>
               </div>
             ) : tree.length > 0 ? (
               renderTree(tree)
             ) : (
               <div className="empty-state">
-                <p style={{ color: '#ef4444' }}>Папка бази порожня або не знайдена.</p>
+                <p style={{ color: '#ef4444' }}>База даних порожня або не знайдена.</p>
                 <button 
                   className="btn btn-secondary" 
                   style={{ marginTop: '1rem', fontSize: '0.8rem' }}
                   onClick={() => setShowSettings(true)}
                 >
-                  Вказати шлях до бази
+                  Налаштувати репозиторій
                 </button>
               </div>
             )}
@@ -630,13 +664,8 @@ function App() {
                 </div>
                 <div className="panel-title-container">
                   <h2 className="panel-title">
-                    <FolderIcon isVirtual={selectedNode.isVirtual} />
+                    <FolderIcon isVirtual={true} />
                     {selectedNode.name}
-                    {selectedNode.isVirtual && (
-                      <span style={{ fontSize: '0.75rem', fontWeight: 600, background: 'rgba(168, 85, 247, 0.15)', color: '#c084fc', border: '1px solid rgba(168, 85, 247, 0.3)', padding: '0.15rem 0.5rem', borderRadius: '4px', marginLeft: '0.5rem' }}>
-                        Спільна (JSON)
-                      </span>
-                    )}
                   </h2>
                 </div>
               </div>
@@ -675,45 +704,49 @@ function App() {
                             <DocIcon />
                             <div className="file-info" style={{ flex: 1 }}>
                               <span className="file-name" style={{ fontWeight: isDocSelected ? '600' : '400', color: isDocSelected ? 'var(--text-bright)' : 'var(--text-normal)' }}>{docName}</span>
-                              <span className="file-ext">JSON документ</span>
+                              <span className="file-ext">Документ JSON</span>
                             </div>
-                            <button
-                              onClick={(e) => deleteDocument(docName, e)}
-                              className="tree-toggle-btn"
-                              style={{ 
-                                padding: '0.2rem', 
-                                color: 'rgba(239, 68, 68, 0.7)',
-                                background: 'transparent'
-                              }}
-                              title="Видалити цей документ"
-                            >
-                              <TrashIcon />
-                            </button>
+                            {localStorage.getItem('gh_token') && (
+                              <button
+                                onClick={(e) => deleteDocument(docName, e)}
+                                className="tree-toggle-btn"
+                                style={{ 
+                                  padding: '0.2rem', 
+                                  color: 'rgba(239, 68, 68, 0.7)',
+                                  background: 'transparent'
+                                }}
+                                title="Видалити цей документ"
+                              >
+                                <TrashIcon />
+                              </button>
+                            )}
                           </div>
                         );
                       })}
                     </div>
                   ) : (
                     <div className="no-files-placeholder">
-                      У цій папці ще немає створених текстових документів. Створіть перший документ нижче!
+                      У цій папці ще немає створених текстових документів. {localStorage.getItem('gh_token') ? 'Створіть перший документ нижче!' : 'Увійдіть з токеном, щоб створити перший документ.'}
                     </div>
                   )}
 
                   {/* Add document form */}
-                  <form onSubmit={createDocument} className="action-row" style={{ marginTop: '0.75rem', borderTop: '1px solid rgba(255, 255, 255, 0.05)', paddingTop: '0.75rem' }}>
-                    <input 
-                      type="text" 
-                      placeholder="Назва нового текстового документа (наприклад: Петля накладна)..." 
-                      value={newDocName}
-                      onChange={(e) => setNewDocName(e.target.value)}
-                      className="input-field"
-                      required
-                    />
-                    <button type="submit" className="btn btn-primary">
-                      <PlusIcon />
-                      Створити документ
-                    </button>
-                  </form>
+                  {localStorage.getItem('gh_token') && (
+                    <form onSubmit={createDocument} className="action-row" style={{ marginTop: '0.75rem', borderTop: '1px solid rgba(255, 255, 255, 0.05)', paddingTop: '0.75rem' }}>
+                      <input 
+                        type="text" 
+                        placeholder="Назва нового текстового документа (наприклад: Петля накладна)..." 
+                        value={newDocName}
+                        onChange={(e) => setNewDocName(e.target.value)}
+                        className="input-field"
+                        required
+                      />
+                      <button type="submit" className="btn btn-primary">
+                        <PlusIcon />
+                        Створити документ
+                      </button>
+                    </form>
+                  )}
                 </div>
 
                 {/* 2. Text Note Editor Section */}
@@ -734,6 +767,7 @@ function App() {
                           setNoteContent(e.target.value);
                           if (noteStatus === 'saved') setNoteStatus('idle');
                         }}
+                        readOnly={!localStorage.getItem('gh_token')}
                         className="note-textarea"
                         style={{ height: '220px' }}
                       />
@@ -755,14 +789,18 @@ function App() {
                             </span>
                           )}
                         </div>
-                        <button 
-                          onClick={saveDocument}
-                          disabled={noteStatus === 'saving'}
-                          className="btn btn-primary"
-                        >
-                          <SaveIcon />
-                          Зберегти вміст
-                        </button>
+                        {localStorage.getItem('gh_token') ? (
+                          <button 
+                            onClick={saveDocument}
+                            disabled={noteStatus === 'saving'}
+                            className="btn btn-primary"
+                          >
+                            <SaveIcon />
+                            Зберегти вміст на GitHub
+                          </button>
+                        ) : (
+                          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Режим читання (для редагування введіть токен у налаштуваннях)</span>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -780,26 +818,28 @@ function App() {
                 )}
 
                 {/* 3. Folder Creation Section */}
-                <div className="section-card">
-                  <h3 className="section-title">
-                    <PlusIcon />
-                    Створити підпапку тут
-                  </h3>
-                  <form onSubmit={createSubfolder} className="action-row">
-                    <input 
-                      type="text" 
-                      placeholder="Назва нової підпапки..." 
-                      value={newFolderName}
-                      onChange={(e) => setNewFolderName(e.target.value)}
-                      className="input-field"
-                      required
-                    />
-                    <button type="submit" className="btn btn-primary">
+                {localStorage.getItem('gh_token') && (
+                  <div className="section-card">
+                    <h3 className="section-title">
                       <PlusIcon />
-                      Створити
-                    </button>
-                  </form>
-                </div>
+                      Створити підпапку тут
+                    </h3>
+                    <form onSubmit={createSubfolder} className="action-row">
+                      <input 
+                        type="text" 
+                        placeholder="Назва нової підпапки..." 
+                        value={newFolderName}
+                        onChange={(e) => setNewFolderName(e.target.value)}
+                        className="input-field"
+                        required
+                      />
+                      <button type="submit" className="btn btn-primary">
+                        <PlusIcon />
+                        Створити
+                      </button>
+                    </form>
+                  </div>
+                )}
               </div>
             </>
           ) : (
@@ -810,7 +850,7 @@ function App() {
               <h2>Робоча область менеджера</h2>
               <p>Оберіть папку у лівій панелі, щоб переглянути, створити або редагувати її текстові документи.</p>
               <p style={{ fontSize: '0.8rem', opacity: 0.7, marginTop: '1rem' }}>
-                Поточна папка бази на сервері: <code style={{ color: 'var(--accent-color)', wordBreak: 'break-all' }}>{activePathOnServer}</code>
+                Репозиторій бази даних: <code style={{ color: 'var(--accent-color)', wordBreak: 'break-all' }}>{settingsRepo}</code>
               </p>
             </div>
           )}
