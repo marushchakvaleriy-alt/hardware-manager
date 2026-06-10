@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
 import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore, doc, setDoc, onSnapshot, updateDoc, deleteField, runTransaction, increment } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, onSnapshot, updateDoc, deleteField, runTransaction, increment, collection, getDocs } from 'firebase/firestore';
 
 // SVG Icons
 const FolderIcon = ({ isVirtual }) => (
@@ -860,6 +860,124 @@ function App() {
     }
   };
 
+  const exportDatabase = async () => {
+    try {
+      setLoading(true);
+      let dbObj = { folders: [], notes: {} };
+      
+      if (isFirebaseLoaded && firestore) {
+        // 1. Fetch folders
+        dbObj.folders = folders;
+        
+        // 2. Fetch all notes from collection
+        const querySnapshot = await getDocs(collection(firestore, "folder_notes"));
+        querySnapshot.forEach((docSnap) => {
+          const folderPath = docSnap.id.replace(/___/g, '/');
+          const data = docSnap.data();
+          if (data.notes && Object.keys(data.notes).length > 0) {
+            dbObj.notes[folderPath] = data.notes;
+          }
+        });
+      } else if (isLocalServer) {
+        const res = await fetch('./db.json', { cache: 'no-store' });
+        if (res.ok) {
+          dbObj = await res.json();
+        } else {
+          dbObj = { folders, notes: db.notes || {} };
+        }
+      } else {
+        dbObj = db;
+      }
+      
+      // Trigger download
+      const jsonString = JSON.stringify(dbObj, null, 2);
+      const blob = new Blob([jsonString], { type: 'application/json' });
+      const href = URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = 'db.json';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(href);
+      
+      showToast('Базу даних (db.json) експортовано успішно!', 'success');
+    } catch (e) {
+      console.error(e);
+      showToast('Помилка експорту бази даних: ' + e.message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const importDatabase = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    e.target.value = ''; // Reset file input
+    
+    const confirmMsg = `Увага!\nІмпорт файлу ПОВНІСТЮ перезапише всю вашу поточну структуру папок та текстових документів у базі.\nВи впевнені, що хочете продовжити?`;
+    if (!window.confirm(confirmMsg)) return;
+    
+    try {
+      setLoading(true);
+      const fileText = await file.text();
+      const dbObj = JSON.parse(fileText);
+      
+      if (!dbObj.folders || !dbObj.notes) {
+        throw new Error('Файл має некоректний формат (відсутні розділи folders або notes)');
+      }
+      
+      if (isFirebaseLoaded && firestore) {
+        // 1. Upload folders structure and count notes
+        let totalNotesCount = 0;
+        Object.values(dbObj.notes).forEach(folderNotes => {
+          totalNotesCount += Object.keys(folderNotes).length;
+        });
+        
+        const docRef = doc(firestore, 'metadata', 'structure');
+        await setDoc(docRef, {
+          folders: dbObj.folders,
+          notesCount: totalNotesCount
+        });
+        
+        // 2. Upload notes
+        const promises = Object.entries(dbObj.notes).map(async ([folderPath, folderNotes]) => {
+          const docId = encodePath(folderPath);
+          const fDocRef = doc(firestore, 'folder_notes', docId);
+          await setDoc(fDocRef, { notes: folderNotes });
+        });
+        
+        await Promise.all(promises);
+        showToast('Базу даних успішно імпортовано у Firebase Firestore!', 'success');
+        setSelectedNode(null);
+        setSelectedDoc(null);
+      } else if (isLocalServer) {
+        const res = await fetch('/api/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(dbObj)
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'Помилка завантаження на сервер');
+        }
+        await fetchTree();
+        setSelectedNode(null);
+        setSelectedDoc(null);
+        showToast('Базу даних успішно імпортовано на локальний сервер!', 'success');
+      } else {
+        throw new Error('Імпорт неможливий у режимі читання.');
+      }
+    } catch (err) {
+      console.error(err);
+      showToast(`Помилка імпорту: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const findAndSelectNode = (nodeList, path, reselectDoc = null) => {
     let found = null;
     const search = (nodes) => {
@@ -1067,11 +1185,43 @@ function App() {
           <div className="stat-item">
             Текстових документів: <span className="stat-value">{stats.files}</span>
           </div>
+          
+          {(isFirebaseLoaded || isLocalServer) && (
+            <div style={{ display: 'flex', gap: '0.4rem', marginLeft: '0.5rem' }}>
+              <button 
+                className="settings-btn" 
+                title="Завантажити резервну копію бази (db.json)"
+                onClick={exportDatabase}
+                style={{ border: '1px solid rgba(255, 255, 255, 0.1)', background: 'rgba(255, 255, 255, 0.03)', width: '2rem', height: '2rem', padding: 0 }}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: '1.05rem', height: '1.05rem' }}>
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+              </button>
+              
+              <label 
+                className="settings-btn" 
+                title="Імпортувати резервну копію бази (db.json)"
+                style={{ border: '1px solid rgba(255, 255, 255, 0.1)', background: 'rgba(255, 255, 255, 0.03)', width: '2rem', height: '2rem', padding: 0, margin: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
+              >
+                <input 
+                  type="file" 
+                  accept=".json" 
+                  onChange={importDatabase} 
+                  style={{ display: 'none' }} 
+                />
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: '1.05rem', height: '1.05rem' }}>
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+              </label>
+            </div>
+          )}
+
           <button 
             className="settings-btn" 
             title="Налаштування Firebase"
             onClick={() => setShowSettings(true)}
-            style={{ border: isFirebaseLoaded ? '1px solid #10b981' : '1px solid rgba(255, 255, 255, 0.1)' }}
+            style={{ border: isFirebaseLoaded ? '1px solid #10b981' : '1px solid rgba(255, 255, 255, 0.1)', marginLeft: '0.4rem' }}
           >
             <SettingsIcon />
           </button>

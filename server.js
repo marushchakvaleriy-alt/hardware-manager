@@ -351,6 +351,21 @@ app.put('/api/folder', (req, res) => {
     }
 });
 
+// Import entire database from JSON
+app.post('/api/import', (req, res) => {
+    const { folders, notes } = req.body;
+    if (!folders || !notes) {
+        return res.status(400).json({ success: false, error: 'Некоректна структура бази даних (мають бути folders та notes)' });
+    }
+    try {
+        writeDb({ folders, notes });
+        res.json({ success: true, message: 'Базу даних успішно імпортовано' });
+    } catch (error) {
+        console.error('Error importing database:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Read content of a specific text document in a folder
 app.get('/api/file', (req, res) => {
     const { folderPath, docName } = req.query;
