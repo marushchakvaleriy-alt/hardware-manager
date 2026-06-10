@@ -273,6 +273,84 @@ app.post('/api/folder', (req, res) => {
     }
 });
 
+// Delete a folder and its subfolders (and all notes inside them)
+app.delete('/api/folder', (req, res) => {
+    const { folderPath } = req.body;
+    if (!folderPath) {
+        return res.status(400).json({ success: false, error: 'Параметр folderPath обов’язковий' });
+    }
+    try {
+        const db = readDb();
+        // Remove folder and all its subfolders
+        db.folders = db.folders.filter(f => f !== folderPath && !f.startsWith(`${folderPath}/`));
+        
+        // Delete notes for this folder and subfolders
+        let deletedNotesCount = 0;
+        Object.keys(db.notes).forEach(fPath => {
+            if (fPath === folderPath || fPath.startsWith(`${folderPath}/`)) {
+                deletedNotesCount += Object.keys(db.notes[fPath]).length;
+                delete db.notes[fPath];
+            }
+        });
+        
+        writeDb(db);
+        res.json({ success: true, message: `Папку та її підпапки видалено. Видалено документів: ${deletedNotesCount}` });
+    } catch (error) {
+        console.error('Error deleting folder:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Rename a folder (and its subfolders and notes)
+app.put('/api/folder', (req, res) => {
+    const { oldFolderPath, newFolderName } = req.body;
+    if (!oldFolderPath || !newFolderName) {
+        return res.status(400).json({ success: false, error: 'Параметри oldFolderPath та newFolderName обов’язкові' });
+    }
+    
+    const parts = oldFolderPath.split('/');
+    const parentPath = parts.slice(0, -1).join('/');
+    const safeFolderName = newFolderName.replace(/[\\/:*?"<>|]/g, '_');
+    const newFolderPath = parentPath ? `${parentPath}/${safeFolderName}` : safeFolderName;
+    
+    try {
+        const db = readDb();
+        
+        if (db.folders.includes(newFolderPath)) {
+            return res.status(400).json({ success: false, error: 'Папка з такою назвою вже існує у базі' });
+        }
+        
+        // Rename in folders array
+        db.folders = db.folders.map(f => {
+            if (f === oldFolderPath) return newFolderPath;
+            if (f.startsWith(`${oldFolderPath}/`)) {
+                return f.replace(oldFolderPath, newFolderPath);
+            }
+            return f;
+        });
+        
+        // Rename in notes object
+        const updatedNotes = {};
+        Object.keys(db.notes).forEach(fPath => {
+            if (fPath === oldFolderPath) {
+                updatedNotes[newFolderPath] = db.notes[fPath];
+            } else if (fPath.startsWith(`${oldFolderPath}/`)) {
+                const newPath = fPath.replace(oldFolderPath, newFolderPath);
+                updatedNotes[newPath] = db.notes[fPath];
+            } else {
+                updatedNotes[fPath] = db.notes[fPath];
+            }
+        });
+        db.notes = updatedNotes;
+        
+        writeDb(db);
+        res.json({ success: true, newFolderPath });
+    } catch (error) {
+        console.error('Error renaming folder:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Read content of a specific text document in a folder
 app.get('/api/file', (req, res) => {
     const { folderPath, docName } = req.query;

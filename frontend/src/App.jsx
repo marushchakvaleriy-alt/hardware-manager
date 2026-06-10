@@ -91,6 +91,8 @@ const initFirebase = (config) => {
   }
 };
 
+const isLocalServer = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+
 function App() {
   const [db, setDb] = useState({ folders: [], notes: {} }); // Fallback local database
   const [folders, setFolders] = useState([]);
@@ -153,7 +155,7 @@ function App() {
       
       // Fallback: If no config in JSON and none in localStorage, load static local db.json
       if (!localStorage.getItem('firebase_config')) {
-        await loadFallbackDb();
+        await fetchTree();
       }
     };
     loadConfig();
@@ -196,12 +198,12 @@ function App() {
           setIsFirebaseLoaded(true);
         } else {
           setIsFirebaseLoaded(false);
-          loadFallbackDb();
+          fetchTree();
         }
       } catch (e) {
         console.error("Помилка ініціалізації Firebase:", e);
         setIsFirebaseLoaded(false);
-        loadFallbackDb();
+        fetchTree();
       }
     } else {
       setFirestore(null);
@@ -250,13 +252,20 @@ function App() {
     }, (error) => {
       console.error("Помилка завантаження структури з Firestore:", error);
       showToast("Помилка підключення до Firestore. Режим читання.", "error");
-      loadFallbackDb();
+      fetchTree();
     });
     
     return () => unsubscribe();
   }, [firestore]);
 
-  // 4. Real-time folder notes listener (Firebase or fallback mode)
+  // 4. Load folders tree when Firebase is not loaded
+  useEffect(() => {
+    if (!isFirebaseLoaded) {
+      fetchTree();
+    }
+  }, [isFirebaseLoaded]);
+
+  // 5. Real-time folder notes listener (Firebase or local/fallback mode)
   useEffect(() => {
     if (isFirebaseLoaded && firestore && selectedNode) {
       const docId = encodePath(selectedNode.path);
@@ -282,7 +291,7 @@ function App() {
     }
   }, [isFirebaseLoaded, firestore, selectedNode?.path, db.notes]);
 
-  // 5. Update editor if note is updated in background and state is idle
+  // 6. Update editor if note is updated in background and state is idle
   useEffect(() => {
     if (selectedDoc && selectedFolderNotes[selectedDoc] !== undefined) {
       if (noteStatus === 'idle') {
@@ -327,6 +336,66 @@ function App() {
     return rootTree;
   };
 
+  const fetchTree = async (reselectPath = null, reselectDoc = null) => {
+    try {
+      if (!reselectPath) setLoading(true);
+      
+      if (isFirebaseLoaded) {
+        return; // reactive Firestore stream handles updates
+      }
+      
+      if (isLocalServer) {
+        // Fetch full tree from local Express API
+        const res = await fetch('/api/tree');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success) {
+            setTree(data.tree);
+            
+            // Calculate stats
+            let foldersCount = 0;
+            let filesCount = 0;
+            const countNodes = (nodes) => {
+              nodes.forEach(n => {
+                if (n.isDir) {
+                  foldersCount++;
+                  if (n.documents) {
+                    filesCount += n.documents.length;
+                  }
+                  if (n.children) countNodes(n.children);
+                }
+              });
+            };
+            countNodes(data.tree);
+            setStats({ folders: foldersCount, files: filesCount });
+            
+            // Re-populate folders list flat array for searches and validations
+            const flatFoldersList = [];
+            const flatten = (nodes) => {
+              nodes.forEach(n => {
+                flatFoldersList.push(n.path);
+                if (n.children) flatten(n.children);
+              });
+            };
+            flatten(data.tree);
+            setFolders(flatFoldersList);
+
+            if (reselectPath) {
+              findAndSelectNode(data.tree, reselectPath, reselectDoc);
+            }
+          }
+        }
+      } else {
+        await loadFallbackDb();
+      }
+    } catch (err) {
+      console.error(err);
+      showToast('Помилка завантаження дерева папок', 'error');
+    } finally {
+      if (!reselectPath) setLoading(false);
+    }
+  };
+
   const saveSettings = (e) => {
     e.preventDefault();
     const newConfig = {
@@ -364,7 +433,7 @@ function App() {
     setShowSettings(false);
     setSelectedNode(null);
     setSelectedDoc(null);
-    loadFallbackDb();
+    fetchTree();
   };
 
   const selectFolder = (node) => {
@@ -374,31 +443,72 @@ function App() {
     setNoteStatus('idle');
     setNewFolderName('');
     setNewDocName('');
+    
+    if (!isFirebaseLoaded && !isLocalServer && db.notes) {
+      const notes = db.notes[node.path] || {};
+      setSelectedFolderNotes(notes);
+    }
   };
 
-  const selectDocument = (docName) => {
+  const selectDocument = async (docName) => {
     if (!selectedNode) return;
     setSelectedDoc(docName);
-    setNoteContent(selectedFolderNotes[docName] || '');
+    setNoteContent('');
     setNoteStatus('idle');
+
+    if (isFirebaseLoaded) {
+      setNoteContent(selectedFolderNotes[docName] || '');
+    } else if (isLocalServer) {
+      try {
+        const res = await fetch(`/api/file?folderPath=${encodeURIComponent(selectedNode.path)}&docName=${encodeURIComponent(docName)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success) {
+            setNoteContent(data.content || '');
+          }
+        }
+      } catch (err) {
+        console.error("Помилка завантаження вмісту нотатки:", err);
+      }
+    } else {
+      setNoteContent(selectedFolderNotes[docName] || '');
+    }
   };
 
   const saveDocument = async () => {
-    if (!firestore || !selectedNode || !selectedDoc) return;
+    if (!selectedNode || !selectedDoc) return;
     setNoteStatus('saving');
 
     try {
-      const docId = encodePath(selectedNode.path);
-      const docRef = doc(firestore, 'folder_notes', docId);
-      
-      await setDoc(docRef, {
-        notes: {
-          [selectedDoc]: noteContent
+      if (isFirebaseLoaded) {
+        const docId = encodePath(selectedNode.path);
+        const docRef = doc(firestore, 'folder_notes', docId);
+        
+        await setDoc(docRef, {
+          notes: {
+            [selectedDoc]: noteContent
+          }
+        }, { merge: true });
+      } else if (isLocalServer) {
+        const res = await fetch('/api/file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            folderPath: selectedNode.path,
+            docName: selectedDoc,
+            content: noteContent
+          })
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'Помилка збереження на локальному сервері');
         }
-      }, { merge: true });
+      } else {
+        throw new Error('Режим читання. Налаштуйте Firebase або локальний сервер для запису.');
+      }
       
       setNoteStatus('saved');
-      showToast(`Документ "${selectedDoc}" успішно збережено в Firestore!`, 'success');
+      showToast(`Документ "${selectedDoc}" успішно збережено!`, 'success');
       setTimeout(() => setNoteStatus('idle'), 2000);
     } catch (err) {
       console.error(err);
@@ -409,30 +519,48 @@ function App() {
 
   const createDocument = async (e) => {
     e.preventDefault();
-    if (!firestore || !selectedNode || !newDocName.trim()) return;
+    if (!selectedNode || !newDocName.trim()) return;
 
     const docName = newDocName.trim();
 
-    if (selectedFolderNotes[docName] !== undefined) {
+    if (currentDocs.includes(docName)) {
       showToast('Документ з такою назвою вже існує', 'error');
       return;
     }
 
     try {
-      const docId = encodePath(selectedNode.path);
-      const docRef = doc(firestore, 'folder_notes', docId);
-      
-      await setDoc(docRef, {
-        notes: {
-          [docName]: ''
-        }
-      }, { merge: true });
+      if (isFirebaseLoaded) {
+        const docId = encodePath(selectedNode.path);
+        const docRef = doc(firestore, 'folder_notes', docId);
+        
+        await setDoc(docRef, {
+          notes: {
+            [docName]: ''
+          }
+        }, { merge: true });
 
-      // Increment note count globally
-      const structureRef = doc(firestore, 'metadata', 'structure');
-      await updateDoc(structureRef, {
-        notesCount: increment(1)
-      });
+        const structureRef = doc(firestore, 'metadata', 'structure');
+        await updateDoc(structureRef, {
+          notesCount: increment(1)
+        });
+      } else if (isLocalServer) {
+        const res = await fetch('/api/file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            folderPath: selectedNode.path,
+            docName: docName,
+            content: ''
+          })
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'Помилка створення документа');
+        }
+        await fetchTree(selectedNode.path, docName);
+      } else {
+        throw new Error('Режим читання. Налаштуйте Firebase або локальний сервер.');
+      }
       
       setNewDocName('');
       setSelectedDoc(docName);
@@ -447,24 +575,41 @@ function App() {
 
   const deleteDocument = async (docName, e) => {
     e.stopPropagation();
-    if (!firestore || !selectedNode) return;
+    if (!selectedNode) return;
     if (!window.confirm(`Ви дійсно бажаєте видалити документ "${docName}"?`)) {
       return;
     }
 
     try {
-      const docId = encodePath(selectedNode.path);
-      const docRef = doc(firestore, 'folder_notes', docId);
-      
-      await updateDoc(docRef, {
-        [`notes.${docName}`]: deleteField()
-      });
+      if (isFirebaseLoaded) {
+        const docId = encodePath(selectedNode.path);
+        const docRef = doc(firestore, 'folder_notes', docId);
+        
+        await updateDoc(docRef, {
+          [`notes.${docName}`]: deleteField()
+        });
 
-      // Decrement note count globally
-      const structureRef = doc(firestore, 'metadata', 'structure');
-      await updateDoc(structureRef, {
-        notesCount: increment(-1)
-      });
+        const structureRef = doc(firestore, 'metadata', 'structure');
+        await updateDoc(structureRef, {
+          notesCount: increment(-1)
+        });
+      } else if (isLocalServer) {
+        const res = await fetch('/api/file', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            folderPath: selectedNode.path,
+            docName: docName
+          })
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'Помилка видалення документа');
+        }
+        await fetchTree(selectedNode.path, selectedDoc === docName ? null : selectedDoc);
+      } else {
+        throw new Error('Режим читання. Налаштуйте Firebase або локальний сервер.');
+      }
       
       if (selectedDoc === docName) {
         setSelectedDoc(null);
@@ -481,7 +626,7 @@ function App() {
 
   const createSubfolder = async (e) => {
     e.preventDefault();
-    if (!firestore || !selectedNode || !newFolderName.trim()) return;
+    if (!selectedNode || !newFolderName.trim()) return;
 
     const safeFolderName = newFolderName.trim().replace(/[\\/:*?"<>|]/g, '_');
     const newFolderRelPath = `${selectedNode.path}/${safeFolderName}`;
@@ -492,27 +637,226 @@ function App() {
     }
 
     try {
-      const docRef = doc(firestore, 'metadata', 'structure');
-      
-      await runTransaction(firestore, async (transaction) => {
-        const docSnap = await transaction.get(docRef);
-        let currentFolders = [];
-        if (docSnap.exists()) {
-          currentFolders = docSnap.data().folders || [];
+      if (isFirebaseLoaded) {
+        const docRef = doc(firestore, 'metadata', 'structure');
+        await runTransaction(firestore, async (transaction) => {
+          const docSnap = await transaction.get(docRef);
+          let currentFolders = [];
+          if (docSnap.exists()) {
+            currentFolders = docSnap.data().folders || [];
+          }
+          if (!currentFolders.includes(newFolderRelPath)) {
+            currentFolders.push(newFolderRelPath);
+            transaction.set(docRef, { folders: currentFolders }, { merge: true });
+          }
+        });
+      } else if (isLocalServer) {
+        const res = await fetch('/api/folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            parentPath: selectedNode.path,
+            folderName: safeFolderName
+          })
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'Помилка створення папки');
         }
-        if (!currentFolders.includes(newFolderRelPath)) {
-          currentFolders.push(newFolderRelPath);
-          transaction.set(docRef, { folders: currentFolders }, { merge: true });
-        }
-      });
+        await fetchTree(selectedNode.path);
+      } else {
+        throw new Error('Режим читання. Налаштуйте Firebase або локальний сервер.');
+      }
       
       setNewFolderName('');
       showToast(`Папку "${safeFolderName}" створено!`, 'success');
-      
       setExpandedFolders(prev => ({ ...prev, [selectedNode.path]: true }));
     } catch (err) {
       console.error(err);
       showToast(`Помилка створення папки: ${err.message}`, 'error');
+    }
+  };
+
+  const renameFolderPrompt = async () => {
+    if (!selectedNode) return;
+    const newName = prompt(`Введіть нову назву для папки "${selectedNode.name}":`, selectedNode.name);
+    if (!newName || !newName.trim() || newName.trim() === selectedNode.name) return;
+    
+    const cleanNewName = newName.trim().replace(/[\\/:*?"<>|]/g, '_');
+    
+    try {
+      setLoading(true);
+      if (isFirebaseLoaded) {
+        const oldFolderPath = selectedNode.path;
+        const parts = oldFolderPath.split('/');
+        const parentPath = parts.slice(0, -1).join('/');
+        const newFolderPath = parentPath ? `${parentPath}/${cleanNewName}` : cleanNewName;
+        
+        // 1. Update structure metadata document in a transaction
+        const docRef = doc(firestore, 'metadata', 'structure');
+        
+        await runTransaction(firestore, async (transaction) => {
+          const docSnap = await transaction.get(docRef);
+          if (!docSnap.exists()) throw new Error("Не знайдено структуру бази даних!");
+          
+          let currentFolders = docSnap.data().folders || [];
+          if (currentFolders.includes(newFolderPath)) {
+            throw new Error("Папка з такою назвою вже існує в базі!");
+          }
+          
+          const updatedFolders = currentFolders.map(f => {
+            if (f === oldFolderPath) return newFolderPath;
+            if (f.startsWith(`${oldFolderPath}/`)) {
+              return f.replace(oldFolderPath, newFolderPath);
+            }
+            return f;
+          });
+          
+          transaction.set(docRef, { folders: updatedFolders }, { merge: true });
+        });
+        
+        // 2. Rename note documents in Firebase by copying notes and clearing old docs
+        const oldDocId = encodePath(oldFolderPath);
+        const newDocId = encodePath(newFolderPath);
+        
+        const oldDocRef = doc(firestore, 'folder_notes', oldDocId);
+        const newDocRef = doc(firestore, 'folder_notes', newDocId);
+        
+        const subfoldersToMove = folders.filter(f => f.startsWith(`${oldFolderPath}/`));
+        
+        const docSnap = await runTransaction(firestore, async (transaction) => {
+          const snap = await transaction.get(oldDocRef);
+          return snap;
+        });
+        
+        if (docSnap.exists()) {
+          const notesData = docSnap.data().notes || {};
+          await setDoc(newDocRef, { notes: notesData });
+          await setDoc(oldDocRef, { notes: {} });
+        }
+        
+        // Move subfolders notes
+        for (const sub of subfoldersToMove) {
+          const oldSubDocId = encodePath(sub);
+          const newSubPath = sub.replace(oldFolderPath, newFolderPath);
+          const newSubDocId = encodePath(newSubPath);
+          
+          const oldSubRef = doc(firestore, 'folder_notes', oldSubDocId);
+          const newSubRef = doc(firestore, 'folder_notes', newSubDocId);
+          
+          const subSnap = await runTransaction(firestore, async (transaction) => {
+            const snap = await transaction.get(oldSubRef);
+            return snap;
+          });
+          
+          if (subSnap.exists()) {
+            const subNotes = subSnap.data().notes || {};
+            await setDoc(newSubRef, { notes: subNotes });
+            await setDoc(oldSubRef, { notes: {} });
+          }
+        }
+        
+        showToast(`Папку перейменовано на "${cleanNewName}"!`, 'success');
+        setSelectedNode(null);
+        setSelectedDoc(null);
+      } else if (isLocalServer) {
+        const res = await fetch('/api/folder', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            oldFolderPath: selectedNode.path,
+            newFolderName: cleanNewName
+          })
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'Помилка перейменування на сервері');
+        }
+        const data = await res.json();
+        await fetchTree(data.newFolderPath);
+        showToast(`Папку перейменовано на "${cleanNewName}"!`, 'success');
+      } else {
+        throw new Error('Режим читання. Налаштуйте Firebase або локальний сервер.');
+      }
+    } catch (err) {
+      console.error(err);
+      showToast(`Помилка перейменування: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteFolderPrompt = async () => {
+    if (!selectedNode) return;
+    const confirmMsg = `Ви дійсно бажаєте видалити папку "${selectedNode.name}" та всі її підпапки та текстові документи?\nЦю дію неможливо скасувати!`;
+    if (!window.confirm(confirmMsg)) return;
+    
+    try {
+      setLoading(true);
+      if (isFirebaseLoaded) {
+        const folderPath = selectedNode.path;
+        const docRef = doc(firestore, 'metadata', 'structure');
+        
+        let deletedNotesCount = 0;
+        const foldersToDelete = folders.filter(f => f === folderPath || f.startsWith(`${folderPath}/`));
+        
+        for (const f of foldersToDelete) {
+          const fDocId = encodePath(f);
+          const fDocRef = doc(firestore, 'folder_notes', fDocId);
+          
+          const snap = await runTransaction(firestore, async (transaction) => {
+            const s = await transaction.get(fDocRef);
+            return s;
+          });
+          if (snap.exists()) {
+            const notesData = snap.data().notes || {};
+            deletedNotesCount += Object.keys(notesData).length;
+          }
+          await setDoc(fDocRef, { notes: {} });
+        }
+        
+        await runTransaction(firestore, async (transaction) => {
+          const docSnap = await transaction.get(docRef);
+          if (docSnap.exists()) {
+            const currentFolders = docSnap.data().folders || [];
+            const remainingFolders = currentFolders.filter(f => f !== folderPath && !f.startsWith(`${folderPath}/`));
+            const currentNotesCount = docSnap.data().notesCount || 0;
+            const newNotesCount = Math.max(0, currentNotesCount - deletedNotesCount);
+            
+            transaction.set(docRef, { 
+              folders: remainingFolders,
+              notesCount: newNotesCount
+            }, { merge: true });
+          }
+        });
+        
+        showToast(`Папку та всі її документи видалено!`, 'success');
+        setSelectedNode(null);
+        setSelectedDoc(null);
+      } else if (isLocalServer) {
+        const res = await fetch('/api/folder', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            folderPath: selectedNode.path
+          })
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'Помилка видалення на сервері');
+        }
+        await fetchTree();
+        setSelectedNode(null);
+        setSelectedDoc(null);
+        showToast(`Папку видалено!`, 'success');
+      } else {
+        throw new Error('Режим читання. Налаштуйте Firebase або локальний сервер.');
+      }
+    } catch (err) {
+      console.error(err);
+      showToast(`Помилка видалення: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -603,7 +947,9 @@ function App() {
       });
   };
 
-  const currentDocs = Object.keys(selectedFolderNotes).sort();
+  const currentDocs = isFirebaseLoaded 
+    ? Object.keys(selectedFolderNotes).sort() 
+    : (selectedNode && selectedNode.documents ? selectedNode.documents : []);
 
   return (
     <div className="app-container">
@@ -793,11 +1139,31 @@ function App() {
                     </React.Fragment>
                   ))}
                 </div>
-                <div className="panel-title-container">
-                  <h2 className="panel-title">
+                <div className="panel-title-container" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', gap: '1rem', flexWrap: 'wrap', marginTop: '0.25rem' }}>
+                  <h2 className="panel-title" style={{ margin: 0 }}>
                     <FolderIcon isVirtual={true} />
                     {selectedNode.name}
                   </h2>
+                  {(isFirebaseLoaded || isLocalServer) && (
+                    <div className="folder-actions" style={{ display: 'flex', gap: '0.5rem' }}>
+                      <button 
+                        onClick={renameFolderPrompt} 
+                        className="btn btn-secondary" 
+                        style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem', height: 'fit-content' }}
+                        title="Перейменувати цю папку"
+                      >
+                        Перейменувати
+                      </button>
+                      <button 
+                        onClick={deleteFolderPrompt} 
+                        className="btn btn-secondary" 
+                        style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem', height: 'fit-content', background: '#ef4444', color: '#fff', border: 'none' }}
+                        title="Видалити цю папку та всі підпапки й документи"
+                      >
+                        Видалити
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -835,9 +1201,9 @@ function App() {
                             <DocIcon />
                             <div className="file-info" style={{ flex: 1 }}>
                               <span className="file-name" style={{ fontWeight: isDocSelected ? '600' : '400', color: isDocSelected ? 'var(--text-bright)' : 'var(--text-normal)' }}>{docName}</span>
-                              <span className="file-ext">Документ Firestore</span>
+                              <span className="file-ext">Документ {isFirebaseLoaded ? 'Firestore' : 'Локальний'}</span>
                             </div>
-                            {isFirebaseLoaded && (
+                            {(isFirebaseLoaded || isLocalServer) && (
                               <button
                                 onClick={(e) => deleteDocument(docName, e)}
                                 className="tree-toggle-btn"
@@ -857,12 +1223,12 @@ function App() {
                     </div>
                   ) : (
                     <div className="no-files-placeholder">
-                      У цій папці ще немає створених текстових документів. {isFirebaseLoaded ? 'Створіть перший документ нижче!' : 'Налаштуйте Firebase ⚙️ для редагування.'}
+                      У цій папці ще немає створених текстових документів. {isFirebaseLoaded || isLocalServer ? 'Створіть перший документ нижче!' : 'Налаштуйте Firebase ⚙️ або запустіть локальний сервер для редагування.'}
                     </div>
                   )}
 
                   {/* Add document form */}
-                  {isFirebaseLoaded && (
+                  {(isFirebaseLoaded || isLocalServer) && (
                     <form onSubmit={createDocument} className="action-row" style={{ marginTop: '0.75rem', borderTop: '1px solid rgba(255, 255, 255, 0.05)', paddingTop: '0.75rem' }}>
                       <input 
                         type="text" 
@@ -898,7 +1264,7 @@ function App() {
                           setNoteContent(e.target.value);
                           if (noteStatus === 'saved') setNoteStatus('idle');
                         }}
-                        readOnly={!isFirebaseLoaded}
+                        readOnly={!(isFirebaseLoaded || isLocalServer)}
                         className="note-textarea"
                         style={{ height: '220px' }}
                       />
@@ -920,17 +1286,17 @@ function App() {
                             </span>
                           )}
                         </div>
-                        {isFirebaseLoaded ? (
+                        {isFirebaseLoaded || isLocalServer ? (
                           <button 
                             onClick={saveDocument}
                             disabled={noteStatus === 'saving'}
                             className="btn btn-primary"
                           >
                             <SaveIcon />
-                            Зберегти вміст у Firestore
+                            Зберегти вміст
                           </button>
                         ) : (
-                          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Режим читання (налаштуйте Firebase ⚙️ для редагування)</span>
+                          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Режим читання (налаштуйте Firebase ⚙️ або локальний сервер для редагування)</span>
                         )}
                       </div>
                     </div>
@@ -938,7 +1304,7 @@ function App() {
                 ) : (
                   <div className="section-card" style={{ alignItems: 'center', justifyContent: 'center', padding: '2.5rem', color: 'var(--text-muted)', textAlign: 'center', borderStyle: 'dashed' }}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: '3.5rem', height: '3.5rem', opacity: 0.15, marginBottom: '0.75rem' }}>
-                      <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6z"/>
+                      <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6z"/>
                       <polyline points="14 2 14 8 20 8"/>
                       <line x1="16" y1="13" x2="8" y2="13"/>
                       <line x1="16" y1="17" x2="8" y2="17"/>
@@ -949,7 +1315,7 @@ function App() {
                 )}
 
                 {/* 3. Folder Creation Section */}
-                {isFirebaseLoaded && (
+                {(isFirebaseLoaded || isLocalServer) && (
                   <div className="section-card">
                     <h3 className="section-title">
                       <PlusIcon />
@@ -981,8 +1347,8 @@ function App() {
               <h2>Робоча область менеджера</h2>
               <p>Оберіть папку у лівій панелі, щоб переглянути, створити або редагувати її текстові документи.</p>
               <p style={{ fontSize: '0.8rem', opacity: 0.7, marginTop: '1rem' }}>
-                Статус підключення: <code style={{ color: isFirebaseLoaded ? '#10b981' : '#ef4444' }}>
-                  {isFirebaseLoaded ? 'Firebase Firestore (Спільний онлайн-режим)' : 'Локальний файл db.json (Тільки читання)'}
+                Статус підключення: <code style={{ color: isFirebaseLoaded ? '#10b981' : (isLocalServer ? '#3b82f6' : '#ef4444') }}>
+                  {isFirebaseLoaded ? 'Firebase Firestore (Спільний онлайн-режим)' : (isLocalServer ? 'Локальний сервер Express (Режим редагування)' : 'Локальний файл db.json (Тільки читання)')}
                 </code>
               </p>
             </div>
