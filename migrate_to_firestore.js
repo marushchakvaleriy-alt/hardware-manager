@@ -25,9 +25,15 @@ async function run() {
   }
   
   const projectId = config.projectId;
+  const apiKey = config.apiKey;
   
   if (!projectId || projectId.includes("YOUR_PROJECT_ID")) {
     console.error("Помилка: Неправильний Project ID у конфігурації Firebase!");
+    process.exit(1);
+  }
+  
+  if (!apiKey || apiKey.includes("YOUR_API_KEY")) {
+    console.error("Помилка: Неправильний API Key у конфігурації Firebase!");
     process.exit(1);
   }
   
@@ -89,7 +95,7 @@ async function run() {
   
   // 3. Upload structure document
   console.log("Завантажуємо структуру папок...");
-  const structureUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/metadata/structure`;
+  const structureUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/metadata/structure?key=${apiKey}`;
   try {
     const res = await fetch(structureUrl, {
       method: 'PATCH',
@@ -121,7 +127,7 @@ async function run() {
     
     // Firestore doc ID cannot contain forward slashes, replace with ___
     const docId = folderPath.replace(/\//g, '___');
-    const noteUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/folder_notes/${docId}`;
+    const noteUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/folder_notes/${docId}?key=${apiKey}`;
     
     try {
       const res = await fetch(noteUrl, {
