@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
+import { initializeApp, getApps } from 'firebase/app';
+import { getFirestore, doc, setDoc, onSnapshot, updateDoc, deleteField, runTransaction, increment } from 'firebase/firestore';
 
 // SVG Icons
 const FolderIcon = ({ isVirtual }) => (
@@ -69,8 +71,29 @@ const style = document.createElement('style');
 style.innerHTML = `@keyframes spin { to { transform: rotate(360deg); } }`;
 document.head.appendChild(style);
 
+// Helper functions for path encoding/decoding for Firestore doc IDs
+const encodePath = (path) => {
+  return path.replace(/\//g, '___');
+};
+
+const initFirebase = (config) => {
+  if (!config || !config.apiKey || !config.projectId) return null;
+  try {
+    const apps = getApps();
+    if (apps.length > 0) {
+      return getFirestore(apps[0]);
+    }
+    const app = initializeApp(config);
+    return getFirestore(app);
+  } catch (e) {
+    console.error("Помилка ініціалізації Firebase:", e);
+    return null;
+  }
+};
+
 function App() {
-  const [db, setDb] = useState({ folders: [], notes: {} });
+  const [db, setDb] = useState({ folders: [], notes: {} }); // Fallback local database
+  const [folders, setFolders] = useState([]);
   const [tree, setTree] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -87,14 +110,186 @@ function App() {
   const [toast, setToast] = useState(null);
   const [stats, setStats] = useState({ folders: 0, files: 0 });
 
-  // Settings states
+  // Settings states for Firebase
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsToken, setSettingsToken] = useState(localStorage.getItem('gh_token') || '');
-  const [settingsRepo, setSettingsRepo] = useState(localStorage.getItem('gh_repo') || 'marushchakvaleriy-alt/hardware-manager');
+  const [firebaseConfig, setFirebaseConfig] = useState(() => {
+    const local = localStorage.getItem('firebase_config');
+    return local ? JSON.parse(local) : null;
+  });
 
+  const [apiKey, setApiKey] = useState(firebaseConfig?.apiKey || '');
+  const [projectId, setProjectId] = useState(firebaseConfig?.projectId || '');
+  const [authDomain, setAuthDomain] = useState(firebaseConfig?.authDomain || '');
+  const [storageBucket, setStorageBucket] = useState(firebaseConfig?.storageBucket || '');
+  const [messagingSenderId, setMessagingSenderId] = useState(firebaseConfig?.messagingSenderId || '');
+  const [appId, setAppId] = useState(firebaseConfig?.appId || '');
+
+  const [firestore, setFirestore] = useState(null);
+  const [selectedFolderNotes, setSelectedFolderNotes] = useState({});
+  const [isFirebaseLoaded, setIsFirebaseLoaded] = useState(false);
+
+  // 1. Try to load config from static firebase-config.json
   useEffect(() => {
-    fetchTree();
+    const loadConfig = async () => {
+      try {
+        const res = await fetch('./firebase-config.json');
+        if (res.ok) {
+          const config = await res.json();
+          if (config && config.apiKey && config.projectId) {
+            setFirebaseConfig(config);
+            setApiKey(config.apiKey);
+            setProjectId(config.projectId);
+            setAuthDomain(config.authDomain || '');
+            setStorageBucket(config.storageBucket || '');
+            setMessagingSenderId(config.messagingSenderId || '');
+            setAppId(config.appId || '');
+            localStorage.setItem('firebase_config', JSON.stringify(config));
+            return;
+          }
+        }
+      } catch (e) {
+        console.log("Локальний файл конфігурації Firebase не знайдено, використовується локальне сховище чи db.json.");
+      }
+      
+      // Fallback: If no config in JSON and none in localStorage, load static local db.json
+      if (!localStorage.getItem('firebase_config')) {
+        await loadFallbackDb();
+      }
+    };
+    loadConfig();
   }, []);
+
+  const loadFallbackDb = async () => {
+    try {
+      setLoading(true);
+      const res = await fetch('./db.json', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        setDb(data);
+        const folderList = data.folders || [];
+        setFolders(folderList);
+        const parsedTree = buildTreeFromPaths(folderList);
+        setTree(parsedTree);
+        
+        let docsCount = 0;
+        if (data.notes) {
+          Object.values(data.notes).forEach(folderDocs => {
+            docsCount += Object.keys(folderDocs).length;
+          });
+        }
+        setStats({ folders: folderList.length, files: docsCount });
+      }
+    } catch (e) {
+      console.error("Не вдалося завантажити локальний файл db.json", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 2. Initialize Firebase instance when config changes
+  useEffect(() => {
+    if (firebaseConfig && firebaseConfig.apiKey && firebaseConfig.projectId) {
+      try {
+        const fs = initFirebase(firebaseConfig);
+        if (fs) {
+          setFirestore(fs);
+          setIsFirebaseLoaded(true);
+        } else {
+          setIsFirebaseLoaded(false);
+          loadFallbackDb();
+        }
+      } catch (e) {
+        console.error("Помилка ініціалізації Firebase:", e);
+        setIsFirebaseLoaded(false);
+        loadFallbackDb();
+      }
+    } else {
+      setFirestore(null);
+      setIsFirebaseLoaded(false);
+    }
+  }, [firebaseConfig]);
+
+  // 3. Real-time folder tree listener (Firebase mode)
+  useEffect(() => {
+    if (!firestore) return;
+    
+    setLoading(true);
+    const docRef = doc(firestore, 'metadata', 'structure');
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        const folderList = data.folders || [];
+        setFolders(folderList);
+        
+        const parsedTree = buildTreeFromPaths(folderList);
+        setTree(parsedTree);
+        
+        setStats({
+          folders: folderList.length,
+          files: data.notesCount || 0
+        });
+        
+        // Auto-expand first level folders on initial load
+        if (Object.keys(expandedFolders).length === 0) {
+          const initialExpanded = {};
+          parsedTree.forEach(node => {
+            if (node.isDir) {
+              initialExpanded[node.path] = true;
+            }
+          });
+          setExpandedFolders(initialExpanded);
+        }
+        
+        setLoading(false);
+      } else {
+        setFolders([]);
+        setTree([]);
+        setStats({ folders: 0, files: 0 });
+        setLoading(false);
+      }
+    }, (error) => {
+      console.error("Помилка завантаження структури з Firestore:", error);
+      showToast("Помилка підключення до Firestore. Режим читання.", "error");
+      loadFallbackDb();
+    });
+    
+    return () => unsubscribe();
+  }, [firestore]);
+
+  // 4. Real-time folder notes listener (Firebase or fallback mode)
+  useEffect(() => {
+    if (isFirebaseLoaded && firestore && selectedNode) {
+      const docId = encodePath(selectedNode.path);
+      const docRef = doc(firestore, 'folder_notes', docId);
+      
+      const unsubscribe = onSnapshot(docRef, (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          setSelectedFolderNotes(data.notes || {});
+        } else {
+          setSelectedFolderNotes({});
+        }
+      }, (error) => {
+        console.error("Помилка отримання нотаток папки:", error);
+      });
+      
+      return () => unsubscribe();
+    } else if (!isFirebaseLoaded && selectedNode && db.notes) {
+      const notes = db.notes[selectedNode.path] || {};
+      setSelectedFolderNotes(notes);
+    } else {
+      setSelectedFolderNotes({});
+    }
+  }, [isFirebaseLoaded, firestore, selectedNode?.path, db.notes]);
+
+  // 5. Update editor if note is updated in background and state is idle
+  useEffect(() => {
+    if (selectedDoc && selectedFolderNotes[selectedDoc] !== undefined) {
+      if (noteStatus === 'idle') {
+        setNoteContent(selectedFolderNotes[selectedDoc]);
+      }
+    }
+  }, [selectedFolderNotes, selectedDoc, noteStatus]);
 
   const showToast = (message, type = 'success') => {
     setToast({ message, type });
@@ -103,8 +298,8 @@ function App() {
     }, 4000);
   };
 
-  // Build hierarchical folder tree from paths array in db.json
-  const buildTreeFromPaths = (paths, database) => {
+  // Build hierarchical folder tree from paths array
+  const buildTreeFromPaths = (paths) => {
     const rootTree = [];
     paths.forEach(p => {
       const parts = p.split('/');
@@ -122,10 +317,6 @@ function App() {
             path: accumulatedPath,
             isDir: true,
             children: [],
-            // Attach document names for this folder path
-            documents: database.notes && database.notes[accumulatedPath] 
-              ? Object.keys(database.notes[accumulatedPath]) 
-              : []
           };
           currentLevel.push(node);
           currentLevel.sort((a, b) => a.name.localeCompare(b.name));
@@ -136,143 +327,44 @@ function App() {
     return rootTree;
   };
 
-  const computeStats = (paths, database) => {
-    let docsCount = 0;
-    if (database.notes) {
-      Object.values(database.notes).forEach(folderDocs => {
-        docsCount += Object.keys(folderDocs).length;
-      });
-    }
-    setStats({ folders: paths.length, files: docsCount });
-  };
-
-  // Fetch db.json from GitHub API (if token exists) or fallback to static file
-  const fetchDatabase = async () => {
-    const token = localStorage.getItem('gh_token');
-    const repo = localStorage.getItem('gh_repo') || 'marushchakvaleriy-alt/hardware-manager';
-    
-    if (token) {
-      try {
-        const res = await fetch(`https://api.github.com/repos/${repo}/contents/db.json`, {
-          headers: { 
-            'Authorization': `token ${token}`,
-            'Accept': 'application/vnd.github.v3.raw',
-            'Cache-Control': 'no-cache'
-          }
-        });
-        if (res.ok) {
-          return await res.json();
-        }
-      } catch (e) {
-        console.error('Не вдалося зчитати з GitHub API, пробуємо завантажити локальний файл', e);
-      }
-    }
-    
-    // Fallback: load static file (useful for readers or local runs)
-    const res = await fetch('./db.json', { cache: 'no-store' });
-    if (!res.ok) {
-      throw new Error('Не вдалося завантажити db.json. Перевірте підключення.');
-    }
-    return await res.json();
-  };
-
-  // Save database object to GitHub via Commit API
-  const saveDatabaseToGitHub = async (updatedDb, commitMessage) => {
-    const token = localStorage.getItem('gh_token');
-    const repo = localStorage.getItem('gh_repo') || 'marushchakvaleriy-alt/hardware-manager';
-    
-    if (!token) {
-      throw new Error('Токен авторизації не знайдено! Введіть його у налаштуваннях ⚙️ для редагування.');
-    }
-    
-    // Step 1: Get current file SHA
-    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/db.json`, {
-      headers: {
-        'Authorization': `token ${token}`,
-        'Accept': 'application/vnd.github.v3.json',
-        'Cache-Control': 'no-cache'
-      }
-    });
-    
-    if (!getRes.ok) {
-      throw new Error(`Не вдалося отримати SHA файлу з GitHub: ${getRes.statusText}. Перевірте токен.`);
-    }
-    
-    const getData = await getRes.json();
-    const sha = getData.sha;
-    
-    // Step 2: Write update
-    const jsonStr = JSON.stringify(updatedDb, null, 2);
-    // Unicode-safe Base64 conversion
-    const utf8Bytes = new TextEncoder().encode(jsonStr);
-    const binaryStr = Array.from(utf8Bytes, byte => String.fromCharCode(byte)).join('');
-    const base64Content = btoa(binaryStr);
-    
-    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/db.json`, {
-      method: 'PUT',
-      headers: {
-        'Authorization': `token ${token}`,
-        'Accept': 'application/vnd.github.v3.json',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        message: commitMessage,
-        content: base64Content,
-        sha: sha,
-        branch: 'main'
-      })
-    });
-    
-    if (!putRes.ok) {
-      const errData = await putRes.json();
-      throw new Error(errData.message || 'Помилка запису коміту на GitHub.');
-    }
-    
-    return true;
-  };
-
-  const fetchTree = async (reselectPath = null, reselectDoc = null) => {
-    try {
-      if (!reselectPath) setLoading(true);
-      const data = await fetchDatabase();
-      setDb(data);
-      
-      const parsedTree = buildTreeFromPaths(data.folders || [], data);
-      setTree(parsedTree);
-      computeStats(data.folders || [], data);
-      
-      // Auto-expand first level folders
-      if (!reselectPath) {
-        const initialExpanded = {};
-        parsedTree.forEach(node => {
-          if (node.isDir) {
-            initialExpanded[node.path] = true;
-          }
-        });
-        setExpandedFolders(prev => ({ ...prev, ...initialExpanded }));
-      }
-
-      if (reselectPath) {
-        findAndSelectNode(parsedTree, reselectPath, reselectDoc, data);
-      }
-    } catch (err) {
-      console.error(err);
-      showToast(err.message || 'Помилка завантаження бази даних.', 'error');
-    } finally {
-      if (!reselectPath) setLoading(false);
-    }
-  };
-
   const saveSettings = (e) => {
     e.preventDefault();
-    localStorage.setItem('gh_token', settingsToken.trim());
-    localStorage.setItem('gh_repo', settingsRepo.trim());
+    const newConfig = {
+      apiKey: apiKey.trim(),
+      projectId: projectId.trim(),
+      authDomain: authDomain.trim(),
+      storageBucket: storageBucket.trim(),
+      messagingSenderId: messagingSenderId.trim(),
+      appId: appId.trim()
+    };
     
-    showToast('Налаштування збережено локально у браузері', 'success');
+    if (!newConfig.apiKey || !newConfig.projectId) {
+      showToast("Помилка: API Key та Project ID обов'язкові!", "error");
+      return;
+    }
+    
+    localStorage.setItem('firebase_config', JSON.stringify(newConfig));
+    setFirebaseConfig(newConfig);
+    showToast('Налаштування Firebase збережено у браузері!', 'success');
     setShowSettings(false);
     setSelectedNode(null);
     setSelectedDoc(null);
-    fetchTree();
+  };
+
+  const resetSettings = () => {
+    localStorage.removeItem('firebase_config');
+    setFirebaseConfig(null);
+    setApiKey('');
+    setProjectId('');
+    setAuthDomain('');
+    setStorageBucket('');
+    setMessagingSenderId('');
+    setAppId('');
+    showToast('Налаштування скинуто!', 'success');
+    setShowSettings(false);
+    setSelectedNode(null);
+    setSelectedDoc(null);
+    loadFallbackDb();
   };
 
   const selectFolder = (node) => {
@@ -287,143 +379,144 @@ function App() {
   const selectDocument = (docName) => {
     if (!selectedNode) return;
     setSelectedDoc(docName);
-    setNoteContent('');
+    setNoteContent(selectedFolderNotes[docName] || '');
     setNoteStatus('idle');
-
-    // Read content directly from local db state
-    const folderNotes = db.notes[selectedNode.path] || {};
-    const content = folderNotes[docName] || '';
-    setNoteContent(content);
   };
 
   const saveDocument = async () => {
-    if (!selectedNode || !selectedDoc) return;
+    if (!firestore || !selectedNode || !selectedDoc) return;
     setNoteStatus('saving');
 
     try {
-      const updatedNotes = { ...db.notes };
-      if (!updatedNotes[selectedNode.path]) {
-        updatedNotes[selectedNode.path] = {};
-      }
-      updatedNotes[selectedNode.path][selectedDoc] = noteContent;
-
-      const updatedDb = { ...db, notes: updatedNotes };
+      const docId = encodePath(selectedNode.path);
+      const docRef = doc(firestore, 'folder_notes', docId);
       
-      await saveDatabaseToGitHub(updatedDb, `Збережено вміст документа "${selectedDoc}" у папці "${selectedNode.path}"`);
+      await setDoc(docRef, {
+        notes: {
+          [selectedDoc]: noteContent
+        }
+      }, { merge: true });
       
-      setDb(updatedDb);
       setNoteStatus('saved');
-      showToast(`Документ "${selectedDoc}" успішно збережено на GitHub!`, 'success');
-      
-      // Update state internally
-      await fetchTree(selectedNode.path, selectedDoc);
+      showToast(`Документ "${selectedDoc}" успішно збережено в Firestore!`, 'success');
+      setTimeout(() => setNoteStatus('idle'), 2000);
     } catch (err) {
       console.error(err);
       setNoteStatus('error');
-      showToast(err.message || 'Помилка збереження на GitHub', 'error');
+      showToast(`Помилка збереження: ${err.message}`, 'error');
     }
   };
 
   const createDocument = async (e) => {
     e.preventDefault();
-    if (!selectedNode || !newDocName.trim()) return;
+    if (!firestore || !selectedNode || !newDocName.trim()) return;
 
     const docName = newDocName.trim();
 
-    if (selectedNode.documents && selectedNode.documents.includes(docName)) {
+    if (selectedFolderNotes[docName] !== undefined) {
       showToast('Документ з такою назвою вже існує', 'error');
       return;
     }
 
     try {
-      const updatedNotes = { ...db.notes };
-      if (!updatedNotes[selectedNode.path]) {
-        updatedNotes[selectedNode.path] = {};
-      }
-      updatedNotes[selectedNode.path][docName] = ''; // empty content
+      const docId = encodePath(selectedNode.path);
+      const docRef = doc(firestore, 'folder_notes', docId);
+      
+      await setDoc(docRef, {
+        notes: {
+          [docName]: ''
+        }
+      }, { merge: true });
 
-      const updatedDb = { ...db, notes: updatedNotes };
+      // Increment note count globally
+      const structureRef = doc(firestore, 'metadata', 'structure');
+      await updateDoc(structureRef, {
+        notesCount: increment(1)
+      });
       
-      await saveDatabaseToGitHub(updatedDb, `Створено новий документ "${docName}" у папці "${selectedNode.path}"`);
-      
-      setDb(updatedDb);
       setNewDocName('');
-      showToast(`Документ "${docName}" створено на GitHub`, 'success');
-      
-      await fetchTree(selectedNode.path, docName);
+      setSelectedDoc(docName);
+      setNoteContent('');
+      setNoteStatus('idle');
+      showToast(`Документ "${docName}" створено!`, 'success');
     } catch (err) {
       console.error(err);
-      showToast(err.message || 'Помилка створення документа', 'error');
+      showToast(`Помилка створення документа: ${err.message}`, 'error');
     }
   };
 
   const deleteDocument = async (docName, e) => {
     e.stopPropagation();
+    if (!firestore || !selectedNode) return;
     if (!window.confirm(`Ви дійсно бажаєте видалити документ "${docName}"?`)) {
       return;
     }
 
     try {
-      const updatedNotes = { ...db.notes };
-      if (updatedNotes[selectedNode.path]) {
-        delete updatedNotes[selectedNode.path][docName];
-        if (Object.keys(updatedNotes[selectedNode.path]).length === 0) {
-          delete updatedNotes[selectedNode.path];
-        }
-      }
+      const docId = encodePath(selectedNode.path);
+      const docRef = doc(firestore, 'folder_notes', docId);
+      
+      await updateDoc(docRef, {
+        [`notes.${docName}`]: deleteField()
+      });
 
-      const updatedDb = { ...db, notes: updatedNotes };
+      // Decrement note count globally
+      const structureRef = doc(firestore, 'metadata', 'structure');
+      await updateDoc(structureRef, {
+        notesCount: increment(-1)
+      });
       
-      await saveDatabaseToGitHub(updatedDb, `Видалено документ "${docName}" у папці "${selectedNode.path}"`);
-      
-      setDb(updatedDb);
-      
-      let nextSelectedDoc = selectedDoc;
       if (selectedDoc === docName) {
-        nextSelectedDoc = null;
+        setSelectedDoc(null);
         setNoteContent('');
         setNoteStatus('idle');
       }
       
-      showToast(`Документ "${docName}" видалено`, 'success');
-      await fetchTree(selectedNode.path, nextSelectedDoc);
+      showToast(`Документ "${docName}" видалено!`, 'success');
     } catch (err) {
       console.error(err);
-      showToast(err.message || 'Помилка видалення документа', 'error');
+      showToast(`Помилка видалення: ${err.message}`, 'error');
     }
   };
 
   const createSubfolder = async (e) => {
     e.preventDefault();
-    if (!selectedNode || !newFolderName.trim()) return;
+    if (!firestore || !selectedNode || !newFolderName.trim()) return;
 
     const safeFolderName = newFolderName.trim().replace(/[\\/:*?"<>|]/g, '_');
     const newFolderRelPath = `${selectedNode.path}/${safeFolderName}`;
 
-    if (db.folders.includes(newFolderRelPath)) {
+    if (folders.includes(newFolderRelPath)) {
       showToast('Папка з такою назвою вже існує в базі', 'error');
       return;
     }
 
     try {
-      const updatedFolders = [...db.folders, newFolderRelPath];
-      const updatedDb = { ...db, folders: updatedFolders };
+      const docRef = doc(firestore, 'metadata', 'structure');
       
-      await saveDatabaseToGitHub(updatedDb, `Створено підпапку "${newFolderName}" у "${selectedNode.path}"`);
+      await runTransaction(firestore, async (transaction) => {
+        const docSnap = await transaction.get(docRef);
+        let currentFolders = [];
+        if (docSnap.exists()) {
+          currentFolders = docSnap.data().folders || [];
+        }
+        if (!currentFolders.includes(newFolderRelPath)) {
+          currentFolders.push(newFolderRelPath);
+          transaction.set(docRef, { folders: currentFolders }, { merge: true });
+        }
+      });
       
-      setDb(updatedDb);
       setNewFolderName('');
-      showToast(`Папку "${safeFolderName}" створено на GitHub`, 'success');
+      showToast(`Папку "${safeFolderName}" створено!`, 'success');
       
       setExpandedFolders(prev => ({ ...prev, [selectedNode.path]: true }));
-      await fetchTree(selectedNode.path, selectedDoc);
     } catch (err) {
       console.error(err);
-      showToast(err.message || 'Помилка створення папки', 'error');
+      showToast(`Помилка створення папки: ${err.message}`, 'error');
     }
   };
 
-  const findAndSelectNode = (nodeList, path, reselectDoc = null, currentDb = db) => {
+  const findAndSelectNode = (nodeList, path, reselectDoc = null) => {
     let found = null;
     const search = (nodes) => {
       for (const node of nodes) {
@@ -436,22 +529,12 @@ function App() {
     };
     search(nodeList);
     if (found) {
-      // Re-read current documents list for the node
-      found.documents = currentDb.notes && currentDb.notes[found.path]
-        ? Object.keys(currentDb.notes[found.path])
-        : [];
-      
       setSelectedNode(found);
-      
       if (reselectDoc) {
-        if (found.documents.includes(reselectDoc)) {
-          setSelectedDoc(reselectDoc);
-          const folderNotes = currentDb.notes[found.path] || {};
-          setNoteContent(folderNotes[reselectDoc] || '');
-        } else {
-          setSelectedDoc(null);
-          setNoteContent('');
-        }
+        setSelectedDoc(reselectDoc);
+      } else {
+        setSelectedDoc(null);
+        setNoteContent('');
       }
     }
   };
@@ -504,7 +587,7 @@ function App() {
                 <span style={{ width: '1.4rem' }}></span>
               )}
               
-              <FolderIcon isVirtual={true} /> {/* All folders are in the JSON DB, so render them all styled */}
+              <FolderIcon isVirtual={true} />
               <span className="tree-node-text" title={node.name}>
                 {node.name}
               </span>
@@ -520,7 +603,7 @@ function App() {
       });
   };
 
-  const currentDocs = selectedNode && selectedNode.documents ? selectedNode.documents : [];
+  const currentDocs = Object.keys(selectedFolderNotes).sort();
 
   return (
     <div className="app-container">
@@ -536,39 +619,86 @@ function App() {
         <div className="modal-overlay" onClick={() => setShowSettings(false)}>
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>Налаштування інтеграції GitHub</h3>
+              <h3>Налаштування підключення Firebase</h3>
               <button className="modal-close-btn" onClick={() => setShowSettings(false)}>×</button>
             </div>
             <form onSubmit={saveSettings} className="modal-body">
-              <div className="form-group">
-                <label>GitHub Personal Access Token (PAT):</label>
-                <input 
-                  type="password" 
-                  value={settingsToken}
-                  onChange={(e) => setSettingsToken(e.target.value)}
-                  placeholder="Введіть свій GitHub токен..."
-                  className="input-field"
-                  style={{ width: '100%', marginTop: '0.25rem' }}
-                />
-                <p className="form-help-text">
-                  Токен необхідний для збереження змін (комітів) у репозиторій. Якщо ви хочете лише переглядати документи, токен вводити не потрібно.
-                </p>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                <div className="form-group">
+                  <label>API Key (apiKey):</label>
+                  <input 
+                    type="text" 
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder="AIzaSy..."
+                    className="input-field"
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Project ID (projectId):</label>
+                  <input 
+                    type="text" 
+                    value={projectId}
+                    onChange={(e) => setProjectId(e.target.value)}
+                    placeholder="my-project-123"
+                    className="input-field"
+                    required
+                  />
+                </div>
               </div>
-              <div className="form-group">
-                <label>Координати репозиторію (Користувач/Репозиторій):</label>
-                <input 
-                  type="text" 
-                  value={settingsRepo}
-                  onChange={(e) => setSettingsRepo(e.target.value)}
-                  placeholder="marushchakvaleriy-alt/hardware-manager"
-                  className="input-field"
-                  style={{ width: '100%', marginTop: '0.25rem' }}
-                  required
-                />
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginTop: '0.5rem' }}>
+                <div className="form-group">
+                  <label>Auth Domain:</label>
+                  <input 
+                    type="text" 
+                    value={authDomain}
+                    onChange={(e) => setAuthDomain(e.target.value)}
+                    placeholder="my-project-123.firebaseapp.com"
+                    className="input-field"
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Storage Bucket:</label>
+                  <input 
+                    type="text" 
+                    value={storageBucket}
+                    onChange={(e) => setStorageBucket(e.target.value)}
+                    placeholder="my-project-123.appspot.com"
+                    className="input-field"
+                  />
+                </div>
               </div>
-              <div className="modal-footer">
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginTop: '0.5rem' }}>
+                <div className="form-group">
+                  <label>Messaging Sender ID:</label>
+                  <input 
+                    type="text" 
+                    value={messagingSenderId}
+                    onChange={(e) => setMessagingSenderId(e.target.value)}
+                    placeholder="1234567890"
+                    className="input-field"
+                  />
+                </div>
+                <div className="form-group">
+                  <label>App ID (appId):</label>
+                  <input 
+                    type="text" 
+                    value={appId}
+                    onChange={(e) => setAppId(e.target.value)}
+                    placeholder="1:123:web:abc..."
+                    className="input-field"
+                  />
+                </div>
+              </div>
+              <p className="form-help-text" style={{ marginTop: '0.75rem' }}>
+                Для підключення бази даних у реальному часі введіть ваші Firebase ключі. Ви можете знайти їх у налаштуваннях вашого Firebase-проекту. 
+                Рекомендується скопіювати їх у файл <code>firebase-config.json</code> у проекті, щоб вони завантажувалися автоматично для всієї команди.
+              </p>
+              <div className="modal-footer" style={{ marginTop: '1rem' }}>
+                <button type="button" className="btn btn-secondary" style={{ marginRight: 'auto', background: '#ef4444', color: '#fff' }} onClick={resetSettings}>Скинути налаштування</button>
                 <button type="button" className="btn btn-secondary" onClick={() => setShowSettings(false)}>Скасувати</button>
-                <button type="submit" className="btn btn-primary">Зберегти налаштування</button>
+                <button type="submit" className="btn btn-primary">Зберегти</button>
               </div>
             </form>
           </div>
@@ -582,7 +712,7 @@ function App() {
             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/>
           </svg>
           <h1>База Фурнітури</h1>
-          <span>Хмарний Менеджер Документів</span>
+          <span>Хмарний Менеджер Документів (Firestore)</span>
         </div>
         <div className="stats-container">
           <div className="stat-item">
@@ -593,8 +723,9 @@ function App() {
           </div>
           <button 
             className="settings-btn" 
-            title="Налаштування GitHub"
+            title="Налаштування Firebase"
             onClick={() => setShowSettings(true)}
+            style={{ border: isFirebaseLoaded ? '1px solid #10b981' : '1px solid rgba(255, 255, 255, 0.1)' }}
           >
             <SettingsIcon />
           </button>
@@ -620,7 +751,7 @@ function App() {
             {loading ? (
               <div className="empty-state">
                 <SpinnerIcon />
-                <p>Завантаження бази даних з GitHub...</p>
+                <p>Завантаження бази даних...</p>
               </div>
             ) : tree.length > 0 ? (
               renderTree(tree)
@@ -632,7 +763,7 @@ function App() {
                   style={{ marginTop: '1rem', fontSize: '0.8rem' }}
                   onClick={() => setShowSettings(true)}
                 >
-                  Налаштувати репозиторій
+                  Налаштувати Firebase
                 </button>
               </div>
             )}
@@ -646,7 +777,7 @@ function App() {
               {/* Header */}
               <div className="panel-header">
                 <div className="breadcrumbs">
-                  <span className="breadcrumb-item" onClick={() => fetchTree()}>Колекція</span>
+                  <span className="breadcrumb-item" onClick={() => setSelectedNode(null)}>Колекція</span>
                   {selectedNode.path.split('/').map((part, index, arr) => (
                     <React.Fragment key={index}>
                       <span className="breadcrumb-separator">/</span>
@@ -654,7 +785,7 @@ function App() {
                         className="breadcrumb-item"
                         onClick={() => {
                           const partialPath = arr.slice(0, index + 1).join('/');
-                          findAndSelectNode(tree, partialPath, selectedDoc);
+                          findAndSelectNode(tree, partialPath);
                         }}
                       >
                         {part}
@@ -704,9 +835,9 @@ function App() {
                             <DocIcon />
                             <div className="file-info" style={{ flex: 1 }}>
                               <span className="file-name" style={{ fontWeight: isDocSelected ? '600' : '400', color: isDocSelected ? 'var(--text-bright)' : 'var(--text-normal)' }}>{docName}</span>
-                              <span className="file-ext">Документ JSON</span>
+                              <span className="file-ext">Документ Firestore</span>
                             </div>
-                            {localStorage.getItem('gh_token') && (
+                            {isFirebaseLoaded && (
                               <button
                                 onClick={(e) => deleteDocument(docName, e)}
                                 className="tree-toggle-btn"
@@ -726,12 +857,12 @@ function App() {
                     </div>
                   ) : (
                     <div className="no-files-placeholder">
-                      У цій папці ще немає створених текстових документів. {localStorage.getItem('gh_token') ? 'Створіть перший документ нижче!' : 'Увійдіть з токеном, щоб створити перший документ.'}
+                      У цій папці ще немає створених текстових документів. {isFirebaseLoaded ? 'Створіть перший документ нижче!' : 'Налаштуйте Firebase ⚙️ для редагування.'}
                     </div>
                   )}
 
                   {/* Add document form */}
-                  {localStorage.getItem('gh_token') && (
+                  {isFirebaseLoaded && (
                     <form onSubmit={createDocument} className="action-row" style={{ marginTop: '0.75rem', borderTop: '1px solid rgba(255, 255, 255, 0.05)', paddingTop: '0.75rem' }}>
                       <input 
                         type="text" 
@@ -767,7 +898,7 @@ function App() {
                           setNoteContent(e.target.value);
                           if (noteStatus === 'saved') setNoteStatus('idle');
                         }}
-                        readOnly={!localStorage.getItem('gh_token')}
+                        readOnly={!isFirebaseLoaded}
                         className="note-textarea"
                         style={{ height: '220px' }}
                       />
@@ -789,17 +920,17 @@ function App() {
                             </span>
                           )}
                         </div>
-                        {localStorage.getItem('gh_token') ? (
+                        {isFirebaseLoaded ? (
                           <button 
                             onClick={saveDocument}
                             disabled={noteStatus === 'saving'}
                             className="btn btn-primary"
                           >
                             <SaveIcon />
-                            Зберегти вміст на GitHub
+                            Зберегти вміст у Firestore
                           </button>
                         ) : (
-                          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Режим читання (для редагування введіть токен у налаштуваннях)</span>
+                          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Режим читання (налаштуйте Firebase ⚙️ для редагування)</span>
                         )}
                       </div>
                     </div>
@@ -807,7 +938,7 @@ function App() {
                 ) : (
                   <div className="section-card" style={{ alignItems: 'center', justifyContent: 'center', padding: '2.5rem', color: 'var(--text-muted)', textAlign: 'center', borderStyle: 'dashed' }}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: '3.5rem', height: '3.5rem', opacity: 0.15, marginBottom: '0.75rem' }}>
-                      <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6z"/>
+                      <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6z"/>
                       <polyline points="14 2 14 8 20 8"/>
                       <line x1="16" y1="13" x2="8" y2="13"/>
                       <line x1="16" y1="17" x2="8" y2="17"/>
@@ -818,7 +949,7 @@ function App() {
                 )}
 
                 {/* 3. Folder Creation Section */}
-                {localStorage.getItem('gh_token') && (
+                {isFirebaseLoaded && (
                   <div className="section-card">
                     <h3 className="section-title">
                       <PlusIcon />
@@ -850,7 +981,9 @@ function App() {
               <h2>Робоча область менеджера</h2>
               <p>Оберіть папку у лівій панелі, щоб переглянути, створити або редагувати її текстові документи.</p>
               <p style={{ fontSize: '0.8rem', opacity: 0.7, marginTop: '1rem' }}>
-                Репозиторій бази даних: <code style={{ color: 'var(--accent-color)', wordBreak: 'break-all' }}>{settingsRepo}</code>
+                Статус підключення: <code style={{ color: isFirebaseLoaded ? '#10b981' : '#ef4444' }}>
+                  {isFirebaseLoaded ? 'Firebase Firestore (Спільний онлайн-режим)' : 'Локальний файл db.json (Тільки читання)'}
+                </code>
               </p>
             </div>
           )}
